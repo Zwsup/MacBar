@@ -1,0 +1,8 @@
+# Derleme çıktıları
+*.exe
+*.dll
+*.pdb
+
+# VS Code & Sistem dosyaları
+.vscode/
+Thumbs.db
