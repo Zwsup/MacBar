@@ -1,4 +1,4 @@
-# WinTopBar
+# MacBar
 
 A lightweight, zero-dependency macOS-style auto-hiding top menu bar built natively for Windows using C# and Win32 APIs.
 
