@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -13,14 +14,21 @@ public class MacTopBar : Form
     private Label _clockLabel;
     private Label _batteryLabel;
     private Label _activeAppLabel;
+    private Label _hardwareLabel;
+    private Label _mediaLabel;
+
     private Timer _hoverTimer;
     private Timer _animTimer;
     private Timer _activeWindowTimer;
     private Timer _appIconsTimer;
+    private Timer _hwTimer;
 
     private FlowLayoutPanel _runningAppsPanel;
     private Panel _volumePopup;
     private TrackBar _volumeTrackBar;
+
+    private PerformanceCounter _cpuCounter;
+    private PerformanceCounter _ramCounter;
 
     private int _targetY = -28;
     private int _currentY = -28;
@@ -30,9 +38,11 @@ public class MacTopBar : Form
     private const int SC_MAXIMIZE = 0xF030;
     private const int WM_SYSCOMMAND = 0x0112;
 
-    private const byte VK_VOLUME_MUTE = 0xAD;
     private const byte VK_VOLUME_DOWN = 0xAE;
     private const byte VK_VOLUME_UP = 0xAF;
+    private const byte VK_MEDIA_NEXT_TRACK = 0xB0;
+    private const byte VK_MEDIA_PREV_TRACK = 0xB1;
+    private const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int x, y; }
@@ -76,9 +86,6 @@ public class MacTopBar : Form
     private static extern IntPtr GetClassLongPtr32(IntPtr hWnd, int nIndex);
 
     [DllImport("user32.dll")]
-    public static extern bool DestroyIcon(IntPtr hIcon);
-
-    [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     private static IntPtr GetClassLongPtr(IntPtr hWnd, int nIndex)
@@ -103,6 +110,7 @@ public class MacTopBar : Form
         SetupMotion();
         SetupActiveWindowTracker();
         SetupRunningAppIconsTracker();
+        SetupHardwareMonitor();
     }
 
     protected override CreateParams CreateParams
@@ -127,7 +135,7 @@ public class MacTopBar : Form
 
     private void InitUI()
     {
-        // 1. Sol Panel (Logo + Menüler + Pencere İsmi)
+        // --- SOL PANEL ---
         FlowLayoutPanel leftPanel = new FlowLayoutPanel
         {
             AutoSize = true,
@@ -162,7 +170,7 @@ public class MacTopBar : Form
 
         this.Controls.Add(leftPanel);
 
-        // 2. Sağ Panel (Saat, Pil, Ses, Açık Uygulama İkonları)
+        // --- SAĞ PANEL ---
         FlowLayoutPanel rightPanel = new FlowLayoutPanel
         {
             AutoSize = true,
@@ -173,7 +181,7 @@ public class MacTopBar : Form
             BackColor = Color.Transparent
         };
 
-        // Saat
+        // 1. Saat
         _clockLabel = new Label
         {
             ForeColor = Color.FromArgb(240, 240, 240),
@@ -183,7 +191,7 @@ public class MacTopBar : Form
         };
         rightPanel.Controls.Add(_clockLabel);
 
-        // Pil / Güç
+        // 2. Pil
         _batteryLabel = new Label
         {
             ForeColor = Color.FromArgb(200, 200, 200),
@@ -193,7 +201,40 @@ public class MacTopBar : Form
         };
         rightPanel.Controls.Add(_batteryLabel);
 
-        // Ses Kontrol Butonu
+        // 3. Donanım Monitörü
+        _hardwareLabel = new Label
+        {
+            Text = "CPU: -% | RAM: -%",
+            ForeColor = Color.FromArgb(175, 175, 180),
+            Font = new Font("Segoe UI", 8, FontStyle.Regular),
+            AutoSize = true,
+            Margin = new Padding(8, 6, 6, 0),
+            Cursor = Cursors.Hand
+        };
+        _hardwareLabel.Click += (s, e) => Process.Start("taskmgr.exe");
+        rightPanel.Controls.Add(_hardwareLabel);
+
+        // 4. Medya (Now Playing)
+        _mediaLabel = new Label
+        {
+            Text = "",
+            ForeColor = Color.FromArgb(140, 215, 140),
+            Font = new Font("Segoe UI", 9, FontStyle.Regular),
+            AutoSize = true,
+            Margin = new Padding(8, 5, 6, 0),
+            Visible = false,
+            Cursor = Cursors.Hand
+        };
+
+        ContextMenuStrip mediaMenu = new ContextMenuStrip();
+        mediaMenu.Items.Add("▶ / ❚❚  Oynat / Duraklat", null, (s, e) => TriggerMediaKey(VK_MEDIA_PLAY_PAUSE));
+        mediaMenu.Items.Add("⏭  Sonraki Şarkı", null, (s, e) => TriggerMediaKey(VK_MEDIA_NEXT_TRACK));
+        mediaMenu.Items.Add("⏮  Önceki Şarkı", null, (s, e) => TriggerMediaKey(VK_MEDIA_PREV_TRACK));
+        _mediaLabel.Click += (s, e) => mediaMenu.Show(_mediaLabel, new Point(0, _mediaLabel.Height + 4));
+
+        rightPanel.Controls.Add(_mediaLabel);
+
+        // 5. Ses
         Label volBtn = new Label
         {
             Text = "🔊",
@@ -210,7 +251,7 @@ public class MacTopBar : Form
         };
         rightPanel.Controls.Add(volBtn);
 
-        // Çalışan Uygulamaların Gerçek İkon Paneli
+        // 6. Çalışan Uygulama İkonları
         _runningAppsPanel = new FlowLayoutPanel
         {
             AutoSize = true,
@@ -241,6 +282,35 @@ public class MacTopBar : Form
 
         UpdateStatus();
         alignRight();
+    }
+
+    private void TriggerMediaKey(byte vk)
+    {
+        keybd_event(vk, 0, 0, UIntPtr.Zero);
+        keybd_event(vk, 0, 2, UIntPtr.Zero);
+    }
+
+    private void SetupHardwareMonitor()
+    {
+        try
+        {
+            _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+            _ramCounter = new PerformanceCounter("Memory", "% Committed Bytes In Use");
+
+            _hwTimer = new Timer { Interval = 1500 };
+            _hwTimer.Tick += (s, e) =>
+            {
+                try
+                {
+                    int cpu = (int)_cpuCounter.NextValue();
+                    int ram = (int)_ramCounter.NextValue();
+                    _hardwareLabel.Text = string.Format("CPU: {0}%  RAM: {1}%", cpu, ram);
+                }
+                catch { }
+            };
+            _hwTimer.Start();
+        }
+        catch { }
     }
 
     private void SetupVolumePopup()
@@ -274,7 +344,6 @@ public class MacTopBar : Form
         _volumePopup.Controls.Add(_volumeTrackBar);
         this.Controls.Add(_volumePopup);
 
-        // Popup dışına çıkınca gizleme kontrolü
         _volumePopup.MouseLeave += (s, e) => {
             POINT p;
             GetCursorPos(out p);
@@ -294,12 +363,11 @@ public class MacTopBar : Form
     private void ChangeVolume(byte vk)
     {
         keybd_event(vk, 0, 0, UIntPtr.Zero);
-        keybd_event(vk, 0, 2, UIntPtr.Zero); // KEYEVENTF_KEYUP
+        keybd_event(vk, 0, 2, UIntPtr.Zero);
     }
 
     private void SetupRunningAppIconsTracker()
     {
-        // 2 saniyede bir açık pencerelerin simgelerini tazeler
         _appIconsTimer = new Timer { Interval = 2000 };
         _appIconsTimer.Tick += (s, e) => RefreshRunningIcons();
         _appIconsTimer.Start();
@@ -309,13 +377,13 @@ public class MacTopBar : Form
     private void RefreshRunningIcons()
     {
         List<IntPtr> windows = new List<IntPtr>();
+        string currentPlaying = null;
 
         EnumWindows((hWnd, lParam) => {
             if (!IsWindowVisible(hWnd)) return true;
 
-            int exStyle = GetWindowLong(hWnd, -20); // GWL_EXSTYLE
-            // Alt-Tab'da gizli olanları ve araç pencerelerini filtrele
-            if ((exStyle & 0x80) != 0) return true; // WS_EX_TOOLWINDOW
+            int exStyle = GetWindowLong(hWnd, -20);
+            if ((exStyle & 0x80) != 0) return true;
 
             StringBuilder sb = new StringBuilder(256);
             GetWindowText(hWnd, sb, 256);
@@ -327,6 +395,11 @@ public class MacTopBar : Form
                 GetClassName(hWnd, classSb, 256);
                 string cls = classSb.ToString();
 
+                if (cls.Contains("Chrome_WidgetWin") && title.Contains(" - ") && !title.Contains("Google Chrome") && !title.Contains("Visual Studio"))
+                {
+                    currentPlaying = title;
+                }
+
                 if (cls != "Progman" && cls != "WorkerW" && cls != "Shell_TrayWnd" && cls != "Windows.UI.Core.CoreWindow")
                 {
                     windows.Add(hWnd);
@@ -335,14 +408,24 @@ public class MacTopBar : Form
             return true;
         }, IntPtr.Zero);
 
+        if (!string.IsNullOrEmpty(currentPlaying))
+        {
+            if (currentPlaying.Length > 24) currentPlaying = currentPlaying.Substring(0, 22) + "..";
+            _mediaLabel.Text = "🎵 " + currentPlaying;
+            _mediaLabel.Visible = true;
+        }
+        else
+        {
+            _mediaLabel.Visible = false;
+        }
+
         _runningAppsPanel.SuspendLayout();
         _runningAppsPanel.Controls.Clear();
 
-        // En fazla 8 açık uygulamanın ikonunu sağa diz
         int count = 0;
         foreach (IntPtr wnd in windows)
         {
-            if (count >= 8) break;
+            if (count >= 6) break;
 
             Icon appIcon = GetAppIcon(wnd);
             if (appIcon != null)
@@ -370,13 +453,13 @@ public class MacTopBar : Form
     {
         try
         {
-            IntPtr hIcon = SendMessage(hWnd, 0x007F /* WM_GETICON */, (IntPtr)2 /* ICON_SMALL2 */, IntPtr.Zero);
+            IntPtr hIcon = SendMessage(hWnd, 0x007F, (IntPtr)2, IntPtr.Zero);
             if (hIcon == IntPtr.Zero)
-                hIcon = SendMessage(hWnd, 0x007F, (IntPtr)0 /* ICON_SMALL */, IntPtr.Zero);
+                hIcon = SendMessage(hWnd, 0x007F, (IntPtr)0, IntPtr.Zero);
             if (hIcon == IntPtr.Zero)
-                hIcon = GetClassLongPtr(hWnd, -34 /* GCL_HICONSM */);
+                hIcon = GetClassLongPtr(hWnd, -34);
             if (hIcon == IntPtr.Zero)
-                hIcon = GetClassLongPtr(hWnd, -14 /* GCL_HICON */);
+                hIcon = GetClassLongPtr(hWnd, -14);
 
             if (hIcon != IntPtr.Zero)
                 return Icon.FromHandle(hIcon);
@@ -417,11 +500,11 @@ public class MacTopBar : Form
         }
 
         ContextMenuStrip winMenu = new ContextMenuStrip();
-        winMenu.Items.Add("Bu Bilgisayar Hakkında", null, (s, e) => System.Diagnostics.Process.Start("ms-settings:about"));
-        winMenu.Items.Add("Sistem Ayarları...", null, (s, e) => System.Diagnostics.Process.Start("ms-settings:"));
+        winMenu.Items.Add("Bu Bilgisayar Hakkında", null, (s, e) => Process.Start("ms-settings:about"));
+        winMenu.Items.Add("Sistem Ayarları...", null, (s, e) => Process.Start("ms-settings:"));
         winMenu.Items.Add(new ToolStripSeparator());
-        winMenu.Items.Add("Yeniden Başlat", null, (s, e) => System.Diagnostics.Process.Start("shutdown", "/r /t 0"));
-        winMenu.Items.Add("Sistemi Kapat", null, (s, e) => System.Diagnostics.Process.Start("shutdown", "/s /t 0"));
+        winMenu.Items.Add("Yeniden Başlat", null, (s, e) => Process.Start("shutdown", "/r /t 0"));
+        winMenu.Items.Add("Sistemi Kapat", null, (s, e) => Process.Start("shutdown", "/s /t 0"));
         winMenu.Items.Add(new ToolStripSeparator());
         winMenu.Items.Add("Bar'ı Kapat", null, (s, e) => Application.Exit());
 
@@ -451,8 +534,8 @@ public class MacTopBar : Form
     private ContextMenuStrip CreateFileMenu()
     {
         ContextMenuStrip m = new ContextMenuStrip();
-        m.Items.Add("Yeni Dosya Gezgini (Win+E)", null, (s, e) => System.Diagnostics.Process.Start("explorer.exe"));
-        m.Items.Add("Görev Yöneticisi", null, (s, e) => System.Diagnostics.Process.Start("taskmgr.exe"));
+        m.Items.Add("Yeni Dosya Gezgini (Win+E)", null, (s, e) => Process.Start("explorer.exe"));
+        m.Items.Add("Görev Yöneticisi", null, (s, e) => Process.Start("taskmgr.exe"));
         return m;
     }
 
@@ -499,8 +582,8 @@ public class MacTopBar : Form
     private ContextMenuStrip CreateHelpMenu()
     {
         ContextMenuStrip m = new ContextMenuStrip();
-        m.Items.Add("Windows İpuçları ve Yardım", null, (s, e) => System.Diagnostics.Process.Start("ms-contact-support:"));
-        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.2\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
+        m.Items.Add("Windows İpuçları ve Yardım", null, (s, e) => Process.Start("ms-contact-support:"));
+        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.3\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
         return m;
     }
 
