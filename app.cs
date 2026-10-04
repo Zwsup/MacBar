@@ -1,5 +1,7 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -18,11 +20,12 @@ public class MacTopBar : Form
     private int _currentY = -28;
     private const int BAR_HEIGHT = 28;
 
+    private const int SC_MINIMIZE = 0xF020;
+    private const int SC_MAXIMIZE = 0xF030;
+    private const int WM_SYSCOMMAND = 0x0112;
+
     [StructLayout(LayoutKind.Sequential)]
-    public struct POINT
-    {
-        public int x, y;
-    }
+    public struct POINT { public int x, y; }
 
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT lpPoint);
@@ -35,6 +38,18 @@ public class MacTopBar : Form
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     public MacTopBar()
     {
@@ -75,41 +90,22 @@ public class MacTopBar : Form
 
     private void InitUI()
     {
+        // --- SOL PANEL (Logo, Dinamik İsim, Menüler) ---
         FlowLayoutPanel leftPanel = new FlowLayoutPanel
         {
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             FlowDirection = FlowDirection.LeftToRight,
-            Location = new Point(12, 3),
+            Location = new Point(10, 3),
             Height = BAR_HEIGHT - 3,
             WrapContents = false,
             BackColor = Color.Transparent
         };
 
-        // Windows Logosu
-        Label winLogo = new Label
-        {
-            Text = "⊞",
-            ForeColor = Color.White,
-            Font = new Font("Segoe UI Symbol", 12, FontStyle.Regular),
-            AutoSize = true,
-            Margin = new Padding(0, 0, 10, 0),
-            Cursor = Cursors.Hand
-        };
+        Control logoBox = CreateLogoControl();
+        leftPanel.Controls.Add(logoBox);
 
-        ContextMenuStrip winMenu = new ContextMenuStrip();
-        winMenu.Items.Add("Bu Bilgisayar Hakkında", null, (s, e) => System.Diagnostics.Process.Start("ms-settings:about"));
-        winMenu.Items.Add("Sistem Ayarları...", null, (s, e) => System.Diagnostics.Process.Start("ms-settings:"));
-        winMenu.Items.Add(new ToolStripSeparator());
-        winMenu.Items.Add("Yeniden Başlat", null, (s, e) => System.Diagnostics.Process.Start("shutdown", "/r /t 0"));
-        winMenu.Items.Add("Sistemi Kapat", null, (s, e) => System.Diagnostics.Process.Start("shutdown", "/s /t 0"));
-        winMenu.Items.Add(new ToolStripSeparator());
-        winMenu.Items.Add("Bar'ı Kapat", null, (s, e) => Application.Exit());
-
-        winLogo.Click += (s, e) => winMenu.Show(winLogo, new Point(0, winLogo.Height + 4));
-        leftPanel.Controls.Add(winLogo);
-
-        // Aktif Uygulama Başlığı (Başlangıçta masaüstü olduğu için boş)
+        // Dinamik Genişleyen Aktif Pencere Başlığı (Kırpma yok)
         _activeAppLabel = new Label
         {
             Text = "",
@@ -122,61 +118,244 @@ public class MacTopBar : Form
         };
         leftPanel.Controls.Add(_activeAppLabel);
 
-        // Menü Öğeleri
-        string[] menuItems = { "File", "Edit", "View", "Window", "Help" };
-        foreach (string item in menuItems)
-        {
-            Label lbl = new Label
-            {
-                Text = item,
-                ForeColor = Color.FromArgb(180, 180, 180),
-                Font = new Font("Segoe UI", 9, FontStyle.Regular),
-                AutoSize = true,
-                Margin = new Padding(0, 3, 14, 0),
-                Cursor = Cursors.Hand
-            };
-
-            lbl.MouseEnter += (s, e) => lbl.ForeColor = Color.White;
-            lbl.MouseLeave += (s, e) => lbl.ForeColor = Color.FromArgb(180, 180, 180);
-
-            leftPanel.Controls.Add(lbl);
-        }
+        leftPanel.Controls.Add(CreateMenuLabel("File", CreateFileMenu()));
+        leftPanel.Controls.Add(CreateMenuLabel("Edit", CreateEditMenu()));
+        leftPanel.Controls.Add(CreateMenuLabel("View", CreateViewMenu()));
+        leftPanel.Controls.Add(CreateMenuLabel("Window", CreateWindowMenu()));
+        leftPanel.Controls.Add(CreateMenuLabel("Help", CreateHelpMenu()));
 
         this.Controls.Add(leftPanel);
 
-        // Sağ Taraf: Pil / Masaüstü Durumu
-        _batteryLabel = new Label
+        // --- SAĞ PANEL (Sistem Tepsisi / Tray, Ses, Pil, Saat) ---
+        FlowLayoutPanel rightPanel = new FlowLayoutPanel
         {
-            ForeColor = Color.FromArgb(200, 200, 200),
-            Font = new Font("Segoe UI", 9, FontStyle.Regular),
             AutoSize = true,
-            Location = new Point(this.Width - 230, 5)
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.RightToLeft,
+            Height = BAR_HEIGHT - 3,
+            WrapContents = false,
+            BackColor = Color.Transparent
         };
-        this.Controls.Add(_batteryLabel);
 
-        // Sağ Taraf: Saat
+        // 1. Saat
         _clockLabel = new Label
         {
             ForeColor = Color.FromArgb(240, 240, 240),
             Font = new Font("Segoe UI", 9, FontStyle.Regular),
             AutoSize = true,
-            Location = new Point(this.Width - 140, 5)
+            Margin = new Padding(12, 5, 12, 0)
         };
-        this.Controls.Add(_clockLabel);
+        rightPanel.Controls.Add(_clockLabel);
+
+        // 2. Pil Durumu
+        _batteryLabel = new Label
+        {
+            ForeColor = Color.FromArgb(200, 200, 200),
+            Font = new Font("Segoe UI", 9, FontStyle.Regular),
+            AutoSize = true,
+            Margin = new Padding(6, 5, 6, 0)
+        };
+        rightPanel.Controls.Add(_batteryLabel);
+
+        // 3. Hızlı Sistem Ses Kontrolü
+        Label volBtn = new Label
+        {
+            Text = "🔊",
+            ForeColor = Color.FromArgb(200, 200, 200),
+            Font = new Font("Segoe UI Symbol", 9, FontStyle.Regular),
+            AutoSize = true,
+            Margin = new Padding(6, 4, 6, 0),
+            Cursor = Cursors.Hand
+        };
+        volBtn.Click += (s, e) => System.Diagnostics.Process.Start("ms-settings:sound");
+        rightPanel.Controls.Add(volBtn);
+
+        // 4. Tepsi Taşma Menüsü Butonu (Fotoğraftaki Arka Plan Uygulamalarını Açar)
+        Label trayBtn = new Label
+        {
+            Text = "˄",
+            ForeColor = Color.FromArgb(220, 220, 220),
+            Font = new Font("Segoe UI", 10, FontStyle.Bold),
+            AutoSize = true,
+            Margin = new Padding(8, 3, 6, 0),
+            Cursor = Cursors.Hand
+        };
+        trayBtn.Click += (s, e) => ToggleSystemTrayOverflow();
+        rightPanel.Controls.Add(trayBtn);
+
+        this.Controls.Add(rightPanel);
+
+        // Sağ paneli ekranın sağına yapıştırma
+        Action alignRight = () => {
+            rightPanel.Location = new Point(this.Width - rightPanel.PreferredWidth, 2);
+        };
+        rightPanel.SizeChanged += (s, e) => alignRight();
 
         _clockTimer = new Timer { Interval = 1000 };
-        _clockTimer.Tick += (s, e) => UpdateStatus();
+        _clockTimer.Tick += (s, e) => {
+            UpdateStatus();
+            alignRight();
+        };
         _clockTimer.Start();
+
         UpdateStatus();
+        alignRight();
+    }
+
+    private void ToggleSystemTrayOverflow()
+    {
+        // Windows'un arka planda çalışan uygulama ikonları penceresini bulup çağırır
+        IntPtr trayWnd = FindWindow("NotifyIconOverflowWindow", null);
+        if (trayWnd != IntPtr.Zero)
+        {
+            POINT p;
+            GetCursorPos(out p);
+            // Pencereyi barın hemen altına hizala ve aç
+            SetWindowPos(trayWnd, IntPtr.Zero, p.x - 70, BAR_HEIGHT + 2, 0, 0, 0x0001 | 0x0040);
+            ShowWindow(trayWnd, 5); // SW_SHOW
+        }
+        else
+        {
+            // Windows 11'in yeni arayüzünde hızlı eylemler penceresini tetikler
+            SendKeys.SendWait("^{ESC}");
+        }
+    }
+
+    private Control CreateLogoControl()
+    {
+        PictureBox pb = new PictureBox
+        {
+            Size = new Size(16, 16),
+            Margin = new Padding(2, 3, 10, 0),
+            Cursor = Cursors.Hand,
+            BackColor = Color.Transparent
+        };
+
+        string logoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
+        if (File.Exists(logoPath))
+        {
+            pb.Image = Image.FromFile(logoPath);
+            pb.SizeMode = PictureBoxSizeMode.Zoom;
+        }
+        else
+        {
+            pb.Paint += (s, e) =>
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                using (Brush b = new SolidBrush(Color.White))
+                {
+                    e.Graphics.FillRectangle(b, 0, 0, 7, 7);
+                    e.Graphics.FillRectangle(b, 9, 0, 7, 7);
+                    e.Graphics.FillRectangle(b, 0, 9, 7, 7);
+                    e.Graphics.FillRectangle(b, 9, 9, 7, 7);
+                }
+            };
+        }
+
+        ContextMenuStrip winMenu = new ContextMenuStrip();
+        winMenu.Items.Add("Bu Bilgisayar Hakkında", null, (s, e) => System.Diagnostics.Process.Start("ms-settings:about"));
+        winMenu.Items.Add("Sistem Ayarları...", null, (s, e) => System.Diagnostics.Process.Start("ms-settings:"));
+        winMenu.Items.Add(new ToolStripSeparator());
+        winMenu.Items.Add("Yeniden Başlat", null, (s, e) => System.Diagnostics.Process.Start("shutdown", "/r /t 0"));
+        winMenu.Items.Add("Sistemi Kapat", null, (s, e) => System.Diagnostics.Process.Start("shutdown", "/s /t 0"));
+        winMenu.Items.Add(new ToolStripSeparator());
+        winMenu.Items.Add("Bar'ı Kapat", null, (s, e) => Application.Exit());
+
+        pb.Click += (s, e) => winMenu.Show(pb, new Point(0, pb.Height + 5));
+        return pb;
+    }
+
+    private Label CreateMenuLabel(string text, ContextMenuStrip menu)
+    {
+        Label lbl = new Label
+        {
+            Text = text,
+            ForeColor = Color.FromArgb(180, 180, 180),
+            Font = new Font("Segoe UI", 9, FontStyle.Regular),
+            AutoSize = true,
+            Margin = new Padding(0, 3, 14, 0),
+            Cursor = Cursors.Hand
+        };
+
+        lbl.MouseEnter += (s, e) => lbl.ForeColor = Color.White;
+        lbl.MouseLeave += (s, e) => lbl.ForeColor = Color.FromArgb(180, 180, 180);
+        lbl.Click += (s, e) => menu.Show(lbl, new Point(0, lbl.Height + 5));
+
+        return lbl;
+    }
+
+    private ContextMenuStrip CreateFileMenu()
+    {
+        ContextMenuStrip m = new ContextMenuStrip();
+        m.Items.Add("Yeni Dosya Gezgini (Win+E)", null, (s, e) => System.Diagnostics.Process.Start("explorer.exe"));
+        m.Items.Add("Görev Yöneticisi", null, (s, e) => System.Diagnostics.Process.Start("taskmgr.exe"));
+        return m;
+    }
+
+    private ContextMenuStrip CreateEditMenu()
+    {
+        ContextMenuStrip m = new ContextMenuStrip();
+        m.Items.Add("Geri Al (Undo)", null, (s, e) => SendKeystroke("^z"));
+        m.Items.Add(new ToolStripSeparator());
+        m.Items.Add("Kes (Cut)", null, (s, e) => SendKeystroke("^x"));
+        m.Items.Add("Kopyala (Copy)", null, (s, e) => SendKeystroke("^c"));
+        m.Items.Add("Yapıştır (Paste)", null, (s, e) => SendKeystroke("^v"));
+        m.Items.Add(new ToolStripSeparator());
+        m.Items.Add("Tümünü Seç (Select All)", null, (s, e) => SendKeystroke("^a"));
+        return m;
+    }
+
+    private ContextMenuStrip CreateViewMenu()
+    {
+        ContextMenuStrip m = new ContextMenuStrip();
+        m.Items.Add("Masaüstünü Göster", null, (s, e) => {
+            Type shellType = Type.GetTypeFromProgID("Shell.Application");
+            dynamic shell = Activator.CreateInstance(shellType);
+            shell.ToggleDesktop();
+        });
+        return m;
+    }
+
+    private ContextMenuStrip CreateWindowMenu()
+    {
+        ContextMenuStrip m = new ContextMenuStrip();
+        m.Items.Add("Simge Durumuna Küçült (Minimize)", null, (s, e) => {
+            IntPtr active = GetForegroundWindow();
+            if (active != IntPtr.Zero && active != this.Handle)
+                PostMessage(active, WM_SYSCOMMAND, (IntPtr)SC_MINIMIZE, IntPtr.Zero);
+        });
+        m.Items.Add("Ekranı Kapla / Geri Yükle", null, (s, e) => {
+            IntPtr active = GetForegroundWindow();
+            if (active != IntPtr.Zero && active != this.Handle)
+                PostMessage(active, WM_SYSCOMMAND, (IntPtr)SC_MAXIMIZE, IntPtr.Zero);
+        });
+        return m;
+    }
+
+    private ContextMenuStrip CreateHelpMenu()
+    {
+        ContextMenuStrip m = new ContextMenuStrip();
+        m.Items.Add("Windows İpuçları ve Yardım", null, (s, e) => System.Diagnostics.Process.Start("ms-contact-support:"));
+        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.1\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
+        return m;
+    }
+
+    private void SendKeystroke(string keys)
+    {
+        Timer t = new Timer { Interval = 100 };
+        t.Tick += (s, e) => {
+            t.Stop();
+            t.Dispose();
+            SendKeys.SendWait(keys);
+        };
+        t.Start();
     }
 
     private void UpdateStatus()
     {
         _clockLabel.Text = DateTime.Now.ToString("ddd d MMM  HH:mm");
-        _clockLabel.Location = new Point(this.Width - _clockLabel.PreferredWidth - 16, 5);
 
         PowerStatus power = SystemInformation.PowerStatus;
-
         if (power.BatteryChargeStatus == BatteryChargeStatus.NoSystemBattery)
         {
             _batteryLabel.Text = "⚡ Masaüstü";
@@ -187,8 +366,6 @@ public class MacTopBar : Form
             string chargingSymbol = (power.PowerLineStatus == PowerLineStatus.Online) ? "⚡" : "";
             _batteryLabel.Text = string.Format("{0}% {1}", percent, chargingSymbol);
         }
-
-        _batteryLabel.Location = new Point(_clockLabel.Location.X - _batteryLabel.PreferredWidth - 16, 5);
     }
 
     private void SetupActiveWindowTracker()
@@ -199,12 +376,10 @@ public class MacTopBar : Form
             IntPtr hWnd = GetForegroundWindow();
             if (hWnd == IntPtr.Zero || hWnd == this.Handle) return;
 
-            // Sınıf adını kontrol et (Masaüstü veya Görev Çubuğu mu?)
             StringBuilder classSb = new StringBuilder(256);
             GetClassName(hWnd, classSb, 256);
             string className = classSb.ToString();
 
-            // Progman / WorkerW (Masaüstü), Shell_TrayWnd (Windows Görev Çubuğu)
             bool isDesktopOrShell = className == "Progman" || 
                                     className == "WorkerW" || 
                                     className == "Shell_TrayWnd" || 
@@ -237,15 +412,17 @@ public class MacTopBar : Form
                     return;
                 }
 
+                // Uygulama son eklerini temizle (örn. "Belge - Visual Studio Code" -> "Visual Studio Code")
                 if (title.Contains("-"))
                 {
                     string[] parts = title.Split('-');
                     title = parts[parts.Length - 1].Trim();
                 }
 
-                if (title.Length > 16)
+                // Geniş başlıkları kesmeden göster (Ekranı tamamen taşmayacak 40 karakter sınırı)
+                if (title.Length > 40)
                 {
-                    title = title.Substring(0, 14) + "..";
+                    title = title.Substring(0, 38) + "..";
                 }
 
                 if (_activeAppLabel.Text != title)
