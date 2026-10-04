@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -15,6 +16,11 @@ public class MacTopBar : Form
     private Timer _hoverTimer;
     private Timer _animTimer;
     private Timer _activeWindowTimer;
+    private Timer _appIconsTimer;
+
+    private FlowLayoutPanel _runningAppsPanel;
+    private Panel _volumePopup;
+    private TrackBar _volumeTrackBar;
 
     private int _targetY = -28;
     private int _currentY = -28;
@@ -23,6 +29,10 @@ public class MacTopBar : Form
     private const int SC_MINIMIZE = 0xF020;
     private const int SC_MAXIMIZE = 0xF030;
     private const int WM_SYSCOMMAND = 0x0112;
+
+    private const byte VK_VOLUME_MUTE = 0xAD;
+    private const byte VK_VOLUME_DOWN = 0xAE;
+    private const byte VK_VOLUME_UP = 0xAF;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int x, y; }
@@ -43,13 +53,38 @@ public class MacTopBar : Form
     public static extern IntPtr PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
-    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
-    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    public static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "GetClassLongPtr")]
+    private static extern IntPtr GetClassLongPtr64(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "GetClassLong")]
+    private static extern IntPtr GetClassLongPtr32(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    private static IntPtr GetClassLongPtr(IntPtr hWnd, int nIndex)
+    {
+        return IntPtr.Size > 4 ? GetClassLongPtr64(hWnd, nIndex) : GetClassLongPtr32(hWnd, nIndex);
+    }
 
     public MacTopBar()
     {
@@ -64,8 +99,10 @@ public class MacTopBar : Form
 
         SetupContextMenu();
         InitUI();
+        SetupVolumePopup();
         SetupMotion();
         SetupActiveWindowTracker();
+        SetupRunningAppIconsTracker();
     }
 
     protected override CreateParams CreateParams
@@ -90,7 +127,7 @@ public class MacTopBar : Form
 
     private void InitUI()
     {
-        // --- SOL PANEL (Logo, Dinamik İsim, Menüler) ---
+        // 1. Sol Panel (Logo + Menüler + Pencere İsmi)
         FlowLayoutPanel leftPanel = new FlowLayoutPanel
         {
             AutoSize = true,
@@ -105,7 +142,6 @@ public class MacTopBar : Form
         Control logoBox = CreateLogoControl();
         leftPanel.Controls.Add(logoBox);
 
-        // Dinamik Genişleyen Aktif Pencere Başlığı (Kırpma yok)
         _activeAppLabel = new Label
         {
             Text = "",
@@ -126,7 +162,7 @@ public class MacTopBar : Form
 
         this.Controls.Add(leftPanel);
 
-        // --- SAĞ PANEL (Sistem Tepsisi / Tray, Ses, Pil, Saat) ---
+        // 2. Sağ Panel (Saat, Pil, Ses, Açık Uygulama İkonları)
         FlowLayoutPanel rightPanel = new FlowLayoutPanel
         {
             AutoSize = true,
@@ -137,7 +173,7 @@ public class MacTopBar : Form
             BackColor = Color.Transparent
         };
 
-        // 1. Saat
+        // Saat
         _clockLabel = new Label
         {
             ForeColor = Color.FromArgb(240, 240, 240),
@@ -147,7 +183,7 @@ public class MacTopBar : Form
         };
         rightPanel.Controls.Add(_clockLabel);
 
-        // 2. Pil Durumu
+        // Pil / Güç
         _batteryLabel = new Label
         {
             ForeColor = Color.FromArgb(200, 200, 200),
@@ -157,38 +193,43 @@ public class MacTopBar : Form
         };
         rightPanel.Controls.Add(_batteryLabel);
 
-        // 3. Hızlı Sistem Ses Kontrolü
+        // Ses Kontrol Butonu
         Label volBtn = new Label
         {
             Text = "🔊",
-            ForeColor = Color.FromArgb(200, 200, 200),
-            Font = new Font("Segoe UI Symbol", 9, FontStyle.Regular),
+            ForeColor = Color.FromArgb(220, 220, 220),
+            Font = new Font("Segoe UI Symbol", 10, FontStyle.Regular),
             AutoSize = true,
             Margin = new Padding(6, 4, 6, 0),
             Cursor = Cursors.Hand
         };
-        volBtn.Click += (s, e) => System.Diagnostics.Process.Start("ms-settings:sound");
+        volBtn.MouseEnter += (s, e) => ShowVolumePopup(volBtn);
+        volBtn.MouseWheel += (s, e) => {
+            if (e.Delta > 0) ChangeVolume(VK_VOLUME_UP);
+            else ChangeVolume(VK_VOLUME_DOWN);
+        };
         rightPanel.Controls.Add(volBtn);
 
-        // 4. Tepsi Taşma Menüsü Butonu (Fotoğraftaki Arka Plan Uygulamalarını Açar)
-        Label trayBtn = new Label
+        // Çalışan Uygulamaların Gerçek İkon Paneli
+        _runningAppsPanel = new FlowLayoutPanel
         {
-            Text = "˄",
-            ForeColor = Color.FromArgb(220, 220, 220),
-            Font = new Font("Segoe UI", 10, FontStyle.Bold),
             AutoSize = true,
-            Margin = new Padding(8, 3, 6, 0),
-            Cursor = Cursors.Hand
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.RightToLeft,
+            Height = BAR_HEIGHT - 3,
+            WrapContents = false,
+            BackColor = Color.Transparent,
+            Margin = new Padding(6, 0, 8, 0)
         };
-        trayBtn.Click += (s, e) => ToggleSystemTrayOverflow();
-        rightPanel.Controls.Add(trayBtn);
+        rightPanel.Controls.Add(_runningAppsPanel);
 
         this.Controls.Add(rightPanel);
 
-        // Sağ paneli ekranın sağına yapıştırma
         Action alignRight = () => {
-            rightPanel.Location = new Point(this.Width - rightPanel.PreferredWidth, 2);
+            int rightWidth = rightPanel.GetPreferredSize(Size.Empty).Width;
+            rightPanel.Location = new Point(this.Width - rightWidth, 2);
         };
+
         rightPanel.SizeChanged += (s, e) => alignRight();
 
         _clockTimer = new Timer { Interval = 1000 };
@@ -202,23 +243,146 @@ public class MacTopBar : Form
         alignRight();
     }
 
-    private void ToggleSystemTrayOverflow()
+    private void SetupVolumePopup()
     {
-        // Windows'un arka planda çalışan uygulama ikonları penceresini bulup çağırır
-        IntPtr trayWnd = FindWindow("NotifyIconOverflowWindow", null);
-        if (trayWnd != IntPtr.Zero)
+        _volumePopup = new Panel
         {
+            Size = new Size(130, 36),
+            BackColor = Color.FromArgb(32, 32, 36),
+            Visible = false
+        };
+
+        _volumeTrackBar = new TrackBar
+        {
+            Minimum = 0,
+            Maximum = 10,
+            Value = 5,
+            TickStyle = TickStyle.None,
+            Dock = DockStyle.Fill
+        };
+
+        int lastVal = 5;
+        _volumeTrackBar.ValueChanged += (s, e) => {
+            if (_volumeTrackBar.Value > lastVal)
+                ChangeVolume(VK_VOLUME_UP);
+            else if (_volumeTrackBar.Value < lastVal)
+                ChangeVolume(VK_VOLUME_DOWN);
+
+            lastVal = _volumeTrackBar.Value;
+        };
+
+        _volumePopup.Controls.Add(_volumeTrackBar);
+        this.Controls.Add(_volumePopup);
+
+        // Popup dışına çıkınca gizleme kontrolü
+        _volumePopup.MouseLeave += (s, e) => {
             POINT p;
             GetCursorPos(out p);
-            // Pencereyi barın hemen altına hizala ve aç
-            SetWindowPos(trayWnd, IntPtr.Zero, p.x - 70, BAR_HEIGHT + 2, 0, 0, 0x0001 | 0x0040);
-            ShowWindow(trayWnd, 5); // SW_SHOW
-        }
-        else
+            if (!_volumePopup.Bounds.Contains(this.PointToClient(new Point(p.x, p.y))))
+                _volumePopup.Visible = false;
+        };
+    }
+
+    private void ShowVolumePopup(Control anchor)
+    {
+        Point pt = anchor.Location;
+        _volumePopup.Location = new Point(pt.X - 100, BAR_HEIGHT);
+        _volumePopup.Visible = true;
+        _volumePopup.BringToFront();
+    }
+
+    private void ChangeVolume(byte vk)
+    {
+        keybd_event(vk, 0, 0, UIntPtr.Zero);
+        keybd_event(vk, 0, 2, UIntPtr.Zero); // KEYEVENTF_KEYUP
+    }
+
+    private void SetupRunningAppIconsTracker()
+    {
+        // 2 saniyede bir açık pencerelerin simgelerini tazeler
+        _appIconsTimer = new Timer { Interval = 2000 };
+        _appIconsTimer.Tick += (s, e) => RefreshRunningIcons();
+        _appIconsTimer.Start();
+        RefreshRunningIcons();
+    }
+
+    private void RefreshRunningIcons()
+    {
+        List<IntPtr> windows = new List<IntPtr>();
+
+        EnumWindows((hWnd, lParam) => {
+            if (!IsWindowVisible(hWnd)) return true;
+
+            int exStyle = GetWindowLong(hWnd, -20); // GWL_EXSTYLE
+            // Alt-Tab'da gizli olanları ve araç pencerelerini filtrele
+            if ((exStyle & 0x80) != 0) return true; // WS_EX_TOOLWINDOW
+
+            StringBuilder sb = new StringBuilder(256);
+            GetWindowText(hWnd, sb, 256);
+            string title = sb.ToString();
+
+            if (!string.IsNullOrEmpty(title) && hWnd != this.Handle)
+            {
+                StringBuilder classSb = new StringBuilder(256);
+                GetClassName(hWnd, classSb, 256);
+                string cls = classSb.ToString();
+
+                if (cls != "Progman" && cls != "WorkerW" && cls != "Shell_TrayWnd" && cls != "Windows.UI.Core.CoreWindow")
+                {
+                    windows.Add(hWnd);
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+
+        _runningAppsPanel.SuspendLayout();
+        _runningAppsPanel.Controls.Clear();
+
+        // En fazla 8 açık uygulamanın ikonunu sağa diz
+        int count = 0;
+        foreach (IntPtr wnd in windows)
         {
-            // Windows 11'in yeni arayüzünde hızlı eylemler penceresini tetikler
-            SendKeys.SendWait("^{ESC}");
+            if (count >= 8) break;
+
+            Icon appIcon = GetAppIcon(wnd);
+            if (appIcon != null)
+            {
+                PictureBox pb = new PictureBox
+                {
+                    Size = new Size(16, 16),
+                    Image = appIcon.ToBitmap(),
+                    SizeMode = PictureBoxSizeMode.Zoom,
+                    Margin = new Padding(3, 4, 3, 0),
+                    Cursor = Cursors.Hand
+                };
+
+                IntPtr targetWnd = wnd;
+                pb.Click += (s, e) => SetForegroundWindow(targetWnd);
+
+                _runningAppsPanel.Controls.Add(pb);
+                count++;
+            }
         }
+        _runningAppsPanel.ResumeLayout();
+    }
+
+    private Icon GetAppIcon(IntPtr hWnd)
+    {
+        try
+        {
+            IntPtr hIcon = SendMessage(hWnd, 0x007F /* WM_GETICON */, (IntPtr)2 /* ICON_SMALL2 */, IntPtr.Zero);
+            if (hIcon == IntPtr.Zero)
+                hIcon = SendMessage(hWnd, 0x007F, (IntPtr)0 /* ICON_SMALL */, IntPtr.Zero);
+            if (hIcon == IntPtr.Zero)
+                hIcon = GetClassLongPtr(hWnd, -34 /* GCL_HICONSM */);
+            if (hIcon == IntPtr.Zero)
+                hIcon = GetClassLongPtr(hWnd, -14 /* GCL_HICON */);
+
+            if (hIcon != IntPtr.Zero)
+                return Icon.FromHandle(hIcon);
+        }
+        catch { }
+        return null;
     }
 
     private Control CreateLogoControl()
@@ -336,7 +500,7 @@ public class MacTopBar : Form
     {
         ContextMenuStrip m = new ContextMenuStrip();
         m.Items.Add("Windows İpuçları ve Yardım", null, (s, e) => System.Diagnostics.Process.Start("ms-contact-support:"));
-        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.1\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
+        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.2\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
         return m;
     }
 
@@ -412,14 +576,12 @@ public class MacTopBar : Form
                     return;
                 }
 
-                // Uygulama son eklerini temizle (örn. "Belge - Visual Studio Code" -> "Visual Studio Code")
                 if (title.Contains("-"))
                 {
                     string[] parts = title.Split('-');
                     title = parts[parts.Length - 1].Trim();
                 }
 
-                // Geniş başlıkları kesmeden göster (Ekranı tamamen taşmayacak 40 karakter sınırı)
                 if (title.Length > 40)
                 {
                     title = title.Substring(0, 38) + "..";
@@ -444,13 +606,17 @@ public class MacTopBar : Form
             POINT p;
             if (GetCursorPos(out p))
             {
-                if (p.y <= 2 || (p.y <= BAR_HEIGHT && this.Bounds.Contains(p.x, p.y)))
+                bool inBar = (p.y <= BAR_HEIGHT && this.Bounds.Contains(p.x, p.y));
+                bool inVolume = _volumePopup.Visible && _volumePopup.Bounds.Contains(this.PointToClient(new Point(p.x, p.y)));
+
+                if (p.y <= 2 || inBar || inVolume)
                 {
                     _targetY = 0;
                 }
-                else if (p.y > BAR_HEIGHT + 2)
+                else if (p.y > BAR_HEIGHT + 36)
                 {
                     _targetY = -BAR_HEIGHT;
+                    _volumePopup.Visible = false;
                 }
             }
         };
