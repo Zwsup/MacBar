@@ -16,7 +16,12 @@ public class MacTopBar : Form
     private Label _activeAppLabel;
     private Label _hardwareLabel;
     private Label _mediaLabel;
+    
+    // Açılır-Kapanır Arama Bileşenleri
+    private Panel _searchContainer;
     private TextBox _searchBox;
+    private Label _searchTriggerBtn;
+    private bool _isSearchOpen = false;
 
     private Timer _hoverTimer;
     private Timer _animTimer;
@@ -119,8 +124,7 @@ public class MacTopBar : Form
         get
         {
             CreateParams cp = base.CreateParams;
-            cp.ExStyle |= 0x80;         // WS_EX_TOOLWINDOW
-            // Arama kutusuna klavye odağı verebilmek için WS_EX_NOACTIVATE kaldırıldı
+            cp.ExStyle |= 0x80; // WS_EX_TOOLWINDOW
             return cp;
         }
     }
@@ -169,53 +173,38 @@ public class MacTopBar : Form
         leftPanel.Controls.Add(CreateMenuLabel("Window", CreateWindowMenu()));
         leftPanel.Controls.Add(CreateMenuLabel("Help", CreateHelpMenu()));
 
-        // --- GOOGLE SPOTLIGHT ARAMA KUTUSU ---
-        Panel searchContainer = new Panel
+        // --- AÇILIP KAPANABİLİR GOOGLE ARAMA ALANI ---
+        _searchTriggerBtn = new Label
+        {
+            Text = "🔍",
+            ForeColor = Color.FromArgb(180, 180, 180),
+            Font = new Font("Segoe UI", 9, FontStyle.Regular),
+            AutoSize = true,
+            Margin = new Padding(6, 4, 4, 0),
+            Cursor = Cursors.Hand
+        };
+        _searchTriggerBtn.MouseEnter += (s, e) => _searchTriggerBtn.ForeColor = Color.White;
+        _searchTriggerBtn.MouseLeave += (s, e) => { if (!_isSearchOpen) _searchTriggerBtn.ForeColor = Color.FromArgb(180, 180, 180); };
+        _searchTriggerBtn.Click += (s, e) => ToggleSearch();
+        leftPanel.Controls.Add(_searchTriggerBtn);
+
+        _searchContainer = new Panel
         {
             Width = 150,
             Height = 20,
             BackColor = Color.FromArgb(38, 38, 42),
-            Margin = new Padding(8, 2, 8, 0)
+            Margin = new Padding(2, 2, 8, 0),
+            Visible = false // Başlangıçta gizli
         };
-
-        Label searchIcon = new Label
-        {
-            Text = "🔍",
-            Font = new Font("Segoe UI", 7),
-            ForeColor = Color.FromArgb(160, 160, 160),
-            Size = new Size(16, 16),
-            Location = new Point(3, 2),
-            BackColor = Color.Transparent
-        };
-        searchContainer.Controls.Add(searchIcon);
 
         _searchBox = new TextBox
         {
             BorderStyle = BorderStyle.None,
             BackColor = Color.FromArgb(38, 38, 42),
-            ForeColor = Color.FromArgb(150, 150, 150),
+            ForeColor = Color.White,
             Font = new Font("Segoe UI", 8),
-            Text = "Google'da ara...",
-            Location = new Point(20, 3),
-            Width = 125
-        };
-
-        _searchBox.Enter += (s, e) =>
-        {
-            if (_searchBox.Text == "Google'da ara...")
-            {
-                _searchBox.Text = "";
-                _searchBox.ForeColor = Color.White;
-            }
-        };
-
-        _searchBox.Leave += (s, e) =>
-        {
-            if (string.IsNullOrEmpty(_searchBox.Text.Trim()))
-            {
-                _searchBox.Text = "Google'da ara...";
-                _searchBox.ForeColor = Color.FromArgb(150, 150, 150);
-            }
+            Location = new Point(6, 3),
+            Width = 138
         };
 
         _searchBox.KeyDown += (s, e) =>
@@ -223,28 +212,29 @@ public class MacTopBar : Form
             if (e.KeyCode == Keys.Enter)
             {
                 string query = _searchBox.Text.Trim();
-                if (!string.IsNullOrEmpty(query) && query != "Google'da ara...")
+                if (!string.IsNullOrEmpty(query))
                 {
                     string url = "https://www.google.com/search?q=" + Uri.EscapeDataString(query);
                     Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-                    
-                    _searchBox.Text = "Google'da ara...";
-                    _searchBox.ForeColor = Color.FromArgb(150, 150, 150);
-                    this.ActiveControl = null; // Odağı kaldır
+                    ToggleSearch(false);
                 }
                 e.SuppressKeyPress = true;
             }
             else if (e.KeyCode == Keys.Escape)
             {
-                _searchBox.Text = "Google'da ara...";
-                _searchBox.ForeColor = Color.FromArgb(150, 150, 150);
-                this.ActiveControl = null;
+                ToggleSearch(false);
                 e.SuppressKeyPress = true;
             }
         };
 
-        searchContainer.Controls.Add(_searchBox);
-        leftPanel.Controls.Add(searchContainer);
+        _searchBox.LostFocus += (s, e) =>
+        {
+            // Kullanıcı başka bir yere tıklarsa kutuyu kapat
+            ToggleSearch(false);
+        };
+
+        _searchContainer.Controls.Add(_searchBox);
+        leftPanel.Controls.Add(_searchContainer);
 
         this.Controls.Add(leftPanel);
 
@@ -360,6 +350,25 @@ public class MacTopBar : Form
 
         UpdateStatus();
         alignRight();
+    }
+
+    private void ToggleSearch(bool? forceState = null)
+    {
+        _isSearchOpen = forceState.HasValue ? forceState.Value : !_isSearchOpen;
+
+        if (_isSearchOpen)
+        {
+            _searchContainer.Visible = true;
+            _searchTriggerBtn.ForeColor = Color.White;
+            _searchBox.Text = "";
+            _searchBox.Focus();
+        }
+        else
+        {
+            _searchContainer.Visible = false;
+            _searchTriggerBtn.ForeColor = Color.FromArgb(180, 180, 180);
+            this.ActiveControl = null;
+        }
     }
 
     private void TriggerMediaKey(byte vk)
@@ -661,7 +670,7 @@ public class MacTopBar : Form
     {
         ContextMenuStrip m = new ContextMenuStrip();
         m.Items.Add("Windows İpuçları ve Yardım", null, (s, e) => Process.Start("ms-contact-support:"));
-        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.4\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
+        m.Items.Add("WinTopBar Hakkında", null, (s, e) => MessageBox.Show("WinTopBar v1.5\nmacOS Style Native Top Menu Bar for Windows", "Hakkında"));
         return m;
     }
 
@@ -769,9 +778,9 @@ public class MacTopBar : Form
             {
                 bool inBar = (p.y <= BAR_HEIGHT && this.Bounds.Contains(p.x, p.y));
                 bool inVolume = _volumePopup.Visible && _volumePopup.Bounds.Contains(this.PointToClient(new Point(p.x, p.y)));
-                bool isSearching = (_searchBox != null && _searchBox.Focused);
+                bool isSearching = _isSearchOpen;
 
-                // Arama kutusuna yazı yazılırken veya fare bardayken AÇIK TUT
+                // Arama açıkken veya fare bardayken AÇIK TUT
                 if (p.y <= 2 || inBar || inVolume || isSearching)
                 {
                     _targetY = 0;
